@@ -207,5 +207,121 @@ class SDKContractTests(unittest.TestCase):
             broker.already_submitted('unknown')
 
 
+class InstanceLockTests(unittest.TestCase):
+    def test_another_process_is_blocked_then_can_acquire_after_release(self):
+        import subprocess
+        import sys
+        import tempfile
+        from pathlib import Path
+        from trading_bot import instance_lock
+        script = """
+from pathlib import Path
+import sys
+from trading_bot import instance_lock
+try:
+    with instance_lock(Path(sys.argv[1])):
+        print('acquired')
+except SystemExit as exc:
+    print(str(exc))
+    sys.exit(7)
+"""
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'bot.lock'
+            marker = b'existing lock file content'
+            path.write_bytes(marker)
+            command = [sys.executable, '-c', script, str(path)]
+            with instance_lock(path):
+                blocked = subprocess.run(command, cwd=Path(__file__).parent,
+                                         capture_output=True, text=True, timeout=20)
+                self.assertEqual(blocked.returncode, 7, blocked.stderr)
+                self.assertIn('already running', blocked.stdout)
+            acquired = subprocess.run(command, cwd=Path(__file__).parent,
+                                      capture_output=True, text=True, timeout=20)
+            self.assertEqual(acquired.returncode, 0, acquired.stderr)
+            self.assertIn('acquired', acquired.stdout)
+            self.assertEqual(path.read_bytes(), marker)
+
+    def test_body_exception_is_preserved_and_lock_released(self):
+        import tempfile
+        from pathlib import Path
+        from trading_bot import instance_lock
+        failure = RuntimeError('original cycle failure')
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'bot.lock'
+            with self.assertRaises(RuntimeError) as raised:
+                with instance_lock(path):
+                    raise failure
+            self.assertIs(raised.exception, failure)
+            with instance_lock(path):
+                self.assertTrue(path.exists())
+
+    def test_windows_locks_first_byte_with_flushed_content(self):
+        import os
+        import tempfile
+        from pathlib import Path
+        from trading_bot import instance_lock
+        with tempfile.TemporaryDirectory() as directory:
+            for content in (b'', b'keep existing bytes'):
+                with self.subTest(content=content):
+                    path = Path(directory) / 'bot.lock'
+                    path.write_bytes(content)
+                    descriptors = []
+
+                    def acquire(fd, mode, byte_count):
+                        self.assertEqual(mode, 4242)
+                        self.assertEqual(byte_count, 1)
+                        self.assertEqual(os.lseek(fd, 0, os.SEEK_CUR), 0)
+                        self.assertGreaterEqual(os.fstat(fd).st_size, 1)
+                        self.assertEqual(os.read(fd, 1), content[:1] or b'\0')
+                        descriptors.append(fd)
+
+                    msvcrt = NS(LK_NBLCK=4242, locking=Mock(side_effect=acquire))
+                    with patch.dict('sys.modules', {'msvcrt': msvcrt}), patch('trading_bot.sys.platform', 'win32'):
+                        with instance_lock(path):
+                            self.assertEqual(len(descriptors), 1)
+                        msvcrt.locking.assert_called_once()
+                    self.assertEqual(path.read_bytes(), content or b'\0')
+                    with self.assertRaises(OSError):
+                        os.fstat(descriptors[0])
+
+    def test_windows_contention_is_reported_but_io_errors_propagate(self):
+        import errno
+        import tempfile
+        from pathlib import Path
+        from trading_bot import instance_lock
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'bot.lock'
+            msvcrt = NS(LK_NBLCK=2, locking=Mock())
+            with patch.dict('sys.modules', {'msvcrt': msvcrt}), patch('trading_bot.sys.platform', 'win32'):
+                for code in (errno.EACCES, errno.EAGAIN, errno.EDEADLK):
+                    with self.subTest(errno=code):
+                        msvcrt.locking.side_effect = OSError(code, 'locked')
+                        with self.assertRaisesRegex(SystemExit, 'already running'):
+                            with instance_lock(path):
+                                self.fail('Contention must not enter the bot')
+                failure = OSError(errno.EIO, 'disk error')
+                msvcrt.locking.side_effect = failure
+                with self.assertRaises(OSError) as raised:
+                    with instance_lock(path):
+                        self.fail('I/O errors must not enter the bot')
+                self.assertIs(raised.exception, failure)
+
+    def test_read_only_main_check_never_locks_or_starts_engine(self):
+        import trading_bot
+        with patch('sys.argv', ['trading_bot.py', '--check']), \
+             patch('dotenv.load_dotenv'), \
+             patch.dict('os.environ', {'PAPER': 'true', 'SYMBOL': 'TQQQ'}), \
+             patch('trading_bot.RotatingFileHandler'), \
+             patch('trading_bot.logging.basicConfig'), \
+             patch('trading_bot.instance_lock') as lock, \
+             patch('trading_bot.Engine') as engine, \
+             patch('trading_bot.AlpacaBroker') as broker:
+            trading_bot.main()
+        lock.assert_not_called()
+        engine.assert_not_called()
+        broker.assert_called_once()
+        broker.return_value.check.assert_called_once()
+
+
 if __name__ == '__main__':
     unittest.main()

@@ -5,9 +5,32 @@ long-only Python application. It does not use AI or establish profitability.
 
 ## Install and test
 
-Requires Python 3.10+ on Linux or macOS.
+Use Python 3.12 or 3.13 on Windows, Linux, or macOS.
 
 Use the existing checkout; no separate worktree is needed.
+
+On Windows, open Command Prompt in the extracted project folder:
+
+```bat
+python -m venv .venv
+.venv\Scripts\python.exe -m pip install -r requirements.txt
+.venv\Scripts\python.exe -m unittest -v
+if not exist .env copy .env.example .env
+```
+
+Enter your paper credentials in `.env`, then run the read-only connection check:
+
+```bat
+.venv\Scripts\python.exe trading_bot.py --check
+```
+
+After that succeeds, start paper trading with:
+
+```bat
+.venv\Scripts\python.exe trading_bot.py
+```
+
+On Linux or macOS:
 
 ```sh
 cd AI-Day-Trade  # or the directory where you extracted this project
@@ -27,7 +50,7 @@ Run `.venv/bin/python trading_bot.py` to start; Ctrl-C stops it.
 order when entry conditions are met. Logs appear in the terminal and trade_log.txt (rotated at 5 MB; three backups).
 The process remains alive overnight and checks the broker clock each minute.
 Run it under a process supervisor for unattended use; this repository does not
-configure hosting, monitoring, or automatic restart. Linux/macOS file locking
+configure hosting, monitoring, or automatic restart. Platform-specific file locking
 prevents a second local instance; do not run other copies against the same account.
 
 ## Behavior

@@ -2,13 +2,16 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+import errno
 import hashlib
 import logging
 import math
 import os
 from pathlib import Path
+import sys
 import time
 from logging.handlers import RotatingFileHandler
 
@@ -18,6 +21,29 @@ import pandas as pd
 
 LOG = logging.getLogger(__name__)
 UTC = timezone.utc
+
+
+@contextmanager
+def instance_lock(path: Path):
+    """Hold one local process lock; closing the descriptor releases it."""
+    # Never truncate or unlink: concurrent processes must lock the same file.
+    with path.open("a+b") as lock:
+        try:
+            if sys.platform == "win32":
+                import msvcrt
+                if path.stat().st_size == 0:
+                    lock.write(b"\0")
+                    lock.flush()
+                lock.seek(0)
+                msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            if exc.errno in {errno.EACCES, errno.EAGAIN, errno.EDEADLK}:
+                raise SystemExit("Another local bot instance is already running") from exc
+            raise
+        yield
 
 
 def boolean(value: str) -> bool:
@@ -359,18 +385,14 @@ def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s",
                         handlers=[logging.StreamHandler(), RotatingFileHandler(Path(__file__).with_name("trade_log.txt"), maxBytes=5_000_000, backupCount=3)])
     config = Config(symbol=os.getenv("SYMBOL", "TQQQ"), paper=boolean(os.getenv("PAPER", "true")))
+    if args.check:
+        # Read-only checks do not need an exclusive trading-process lock.
+        AlpacaBroker(config).check(datetime.now(UTC))
+        return
     # Prevent concurrent local instances from racing on the same account/symbol.
-    import fcntl
     lock_path = Path(__file__).with_name(f".bot-{'paper' if config.paper else 'live'}.lock")
-    with lock_path.open("w") as lock:
-        try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            raise SystemExit("Another local bot instance is already running")
+    with instance_lock(lock_path):
         broker = AlpacaBroker(config)
-        if args.check:
-            broker.check(datetime.now(UTC))
-            return
         engine = Engine(broker, config)
         while True:
             try:
