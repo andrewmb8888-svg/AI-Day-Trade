@@ -11,7 +11,7 @@ import requests
 from requests.adapters import HTTPAdapter
 from alpaca.common.exceptions import APIError
 from alpaca.trading.enums import OrderClass, TimeInForce
-from alpaca.trading.models import AccountConfiguration
+from alpaca.trading.models import AccountConfiguration, TradeAccount
 
 from broker import Broker, definitive_rejection
 from common import Settings, TimeoutAdapter
@@ -26,11 +26,12 @@ def error(status):
 
 
 def account(**changes):
-    fields = dict(id="account-one", currency="USD", status="ACTIVE", cash="1000",
+    fields = dict(id="00000000-0000-0000-0000-000000000001", account_number="OFFLINE001",
+                  currency="USD", status="ACTIVE", cash="1000",
                   buying_power="4000", non_marginable_buying_power="1000", equity="10000",
                   short_market_value="0", pending_transfer_out="0", accrued_fees="0",
                   trading_blocked=False, account_blocked=False, trade_suspended_by_user=False)
-    return NS(**{**fields, **changes})
+    return TradeAccount(**{**fields, **changes})
 
 
 def activity(identity="fill-one", **changes):
@@ -67,6 +68,39 @@ def config(**changes):
 
 
 class CredentialsAndTransportTests(unittest.TestCase):
+    def test_real_sdk_snapshot_http_responses_keep_valid_account_types(self):
+        with patch.dict(os.environ, PAPER, clear=True):
+            item = Broker(Settings(symbols=("NVDA",)))
+        self.addCleanup(item.trade._session.close)
+        self.addCleanup(item.data._session.close)
+        first = account().model_dump(mode="json")
+        second = account(cash="800.123456789", buying_power="3200", equity="9500",
+                         non_marginable_buying_power="750", accrued_fees="2",
+                         pending_transfer_out="5", trading_blocked=True).model_dump(mode="json")
+        responses = []
+        for payload in (first, [], [], [], second):
+            response = requests.Response()
+            response.status_code = 200
+            response._content = json.dumps(payload).encode()
+            responses.append(response)
+        with patch("broker._utc_now", return_value=NOW), \
+                patch.object(HTTPAdapter, "send", side_effect=responses) as send:
+            snapshot = item.snapshot(NOW)
+        reconciled = snapshot.account
+        self.assertIsInstance(reconciled, TradeAccount)
+        expected = dict(cash="800.123456789", buying_power="3200", equity="9500",
+                        non_marginable_buying_power="750", accrued_fees="2", pending_transfer_out="5")
+        for field, value in expected.items():
+            with self.subTest(field=field):
+                self.assertIsInstance(getattr(reconciled, field), str)
+                self.assertEqual(getattr(reconciled, field), value)
+        self.assertTrue(reconciled.trading_blocked)
+        TradeAccount.model_validate(reconciled.model_dump())
+        self.assertEqual(send.call_count, 5)
+        self.assertTrue(all(call.args[0].method == "GET" for call in send.call_args_list))
+        self.assertEqual([call.args[0].path_url.split("?")[0] for call in send.call_args_list],
+                         ["/v2/account", "/v2/account/activities/FILL", "/v2/orders", "/v2/positions", "/v2/account"])
+
     def test_credentials_and_live_gate(self):
         with patch.dict(os.environ, {}, clear=True):
             with self.assertRaisesRegex(ValueError, "credentials"):
@@ -192,20 +226,29 @@ class SnapshotTests(unittest.TestCase):
         current_time.start()
         self.addCleanup(current_time.stop)
         self.item = broker()
-        self.item.trade.get_account.side_effect = [account(), account(cash="800", buying_power="3200",
-            non_marginable_buying_power="800", accrued_fees="2", pending_transfer_out="5", trading_blocked=True)]
+        self.first = account()
+        self.second = account(cash="800", buying_power="3200", equity="9000",
+            non_marginable_buying_power="800", accrued_fees="2", pending_transfer_out="5", trading_blocked=True)
+        self.item.trade.get_account.side_effect = [self.first, self.second]
         self.item.trade.get.return_value = []
         self.item.trade.get_orders.return_value = []
         self.item.trade.get_all_positions.return_value = []
 
     def test_minimum_balances_maximum_fees_and_cash_first_order(self):
+        originals = [row.model_dump() for row in (self.first, self.second)]
         with patch("broker._utc_now", return_value=NOW):
             snapshot = self.item.snapshot(NOW - timedelta(minutes=5))
-        self.assertEqual(snapshot.account.cash, Decimal("800"))
-        self.assertEqual(snapshot.account.buying_power, Decimal("3200"))
-        self.assertEqual(snapshot.account.accrued_fees, Decimal("2"))
-        self.assertEqual(snapshot.account.pending_transfer_out, Decimal("5"))
+        self.assertEqual(snapshot.account.cash, "800")
+        self.assertEqual(snapshot.account.buying_power, "3200")
+        self.assertEqual(snapshot.account.non_marginable_buying_power, "800")
+        self.assertEqual(snapshot.account.equity, "9000")
+        self.assertEqual(snapshot.account.accrued_fees, "2")
+        self.assertEqual(snapshot.account.pending_transfer_out, "5")
         self.assertTrue(snapshot.account.trading_blocked)
+        self.assertIsNot(snapshot.account, self.first)
+        self.assertEqual([row.model_dump() for row in (self.first, self.second)], originals)
+        self.item.trade.submit_order.assert_not_called()
+        self.item.trade.set_account_configurations.assert_not_called()
         self.assertEqual(snapshot.started_at, NOW)
         calls = [call[0] for call in self.item.trade.mock_calls]
         self.assertEqual(calls[:4], ["get_account", "get", "get_orders", "get_all_positions"])
@@ -231,11 +274,22 @@ class SnapshotTests(unittest.TestCase):
         self.assertEqual(snapshot.orders, [pending])
 
     def test_wrong_account_or_currency_fails_closed(self):
-        for second in [account(id="different"), account(currency="EUR"), account(short_market_value="-10")]:
+        for second in [account(id="00000000-0000-0000-0000-000000000002"),
+                       account(currency="EUR"), account(short_market_value="-10")]:
             with self.subTest(second=second):
                 self.item.trade.get_account.side_effect = [account(), second]
                 with self.assertRaises(ValueError):
                     self.item.snapshot(NOW)
+
+    def test_optional_fees_and_transfers_default_to_string_zero(self):
+        self.item.trade.get_account.side_effect = [
+            account(accrued_fees=None, pending_transfer_out=None),
+            account(accrued_fees=None, pending_transfer_out=None),
+        ]
+        snapshot = self.item.snapshot(NOW)
+        self.assertEqual(snapshot.account.accrued_fees, "0")
+        self.assertEqual(snapshot.account.pending_transfer_out, "0")
+        TradeAccount.model_validate(snapshot.account.model_dump())
 
     def test_crypto_fill_is_not_treated_as_a_stock_fill(self):
         self.item.trade.get.return_value = [activity(symbol="BTCUSD")]

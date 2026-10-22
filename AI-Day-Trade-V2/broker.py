@@ -213,11 +213,13 @@ class Broker:
             if money(getattr(account, "short_market_value", 0)) != 0:
                 raise ValueError("Existing short exposure is unsupported")
         account = copy(first)
+        # Alpaca's TradeAccount validates assignments and stores monetary fields
+        # as strings. Reconcile with Decimal, then preserve that SDK field type.
         for name in ("cash", "buying_power", "non_marginable_buying_power", "equity"):
-            setattr(account, name, min(money(getattr(first, name)), money(getattr(second, name))))
+            setattr(account, name, str(min(money(getattr(first, name)), money(getattr(second, name)))))
         for name in ("pending_transfer_out", "accrued_fees"):
-            setattr(account, name, max(money(getattr(first, name, None) or 0),
-                                       money(getattr(second, name, None) or 0)))
+            setattr(account, name, str(max(money(getattr(first, name, None) or 0),
+                                           money(getattr(second, name, None) or 0))))
         for name in ("trading_blocked", "account_blocked", "trade_suspended_by_user"):
             setattr(account, name, bool(getattr(first, name, False) or getattr(second, name, False)))
         # Fill records lack an asset-class field: validate every symbol through the
