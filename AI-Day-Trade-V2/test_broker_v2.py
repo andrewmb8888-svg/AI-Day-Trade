@@ -11,7 +11,7 @@ import requests
 from requests.adapters import HTTPAdapter
 from alpaca.common.exceptions import APIError
 from alpaca.trading.enums import OrderClass, TimeInForce
-from alpaca.trading.models import AccountConfiguration, TradeAccount
+from alpaca.trading.models import TradeAccount
 
 from broker import Broker, definitive_rejection
 from common import Settings, TimeoutAdapter
@@ -59,12 +59,16 @@ def broker():
     return result
 
 
-def config(**changes):
+def config(legacy=True, **changes):
     fields = dict(dtbp_check="entry", fractional_trading=True, max_margin_multiplier="4",
                   no_shorting=False, pdt_check="both", suspend_trade=False,
                   trade_confirm_email="none", ptp_no_exception_entry=True,
                   max_options_trading_level=0)
-    return AccountConfiguration(**{**fields, **changes})
+    if not legacy:
+        fields.pop("dtbp_check")
+        fields.pop("pdt_check")
+        fields["closing_transactions_only"] = False
+    return {**fields, **changes}
 
 
 class CredentialsAndTransportTests(unittest.TestCase):
@@ -144,34 +148,122 @@ class CredentialsAndTransportTests(unittest.TestCase):
 
 
 class CashPolicyTests(unittest.TestCase):
+    def test_real_sdk_reads_configuration_without_legacy_pdt_fields(self):
+        for legacy in (True, False):
+            with self.subTest(legacy=legacy), patch.dict(os.environ, PAPER, clear=True):
+                item = Broker(Settings())
+                self.addCleanup(item.trade._session.close)
+                self.addCleanup(item.data._session.close)
+                response = requests.Response()
+                response.status_code = 200
+                response._content = json.dumps(config(legacy=legacy, max_margin_multiplier="1",
+                                                      no_shorting=True)).encode()
+                with patch.object(HTTPAdapter, "send", return_value=response) as send:
+                    self.assertTrue(item.cash_settings())
+                send.assert_called_once()
+                request = send.call_args.args[0]
+                self.assertEqual(request.method, "GET")
+                self.assertEqual(request.path_url, "/v2/account/configurations")
+                self.assertEqual(send.call_args.kwargs["timeout"], (10, 30))
+
+    def test_real_sdk_enforcement_patches_only_guard_fields_and_reads_back(self):
+        with patch.dict(os.environ, PAPER, clear=True):
+            item = Broker(Settings())
+        self.addCleanup(item.trade._session.close)
+        self.addCleanup(item.data._session.close)
+        original = config(legacy=False, closing_transactions_only=True)
+        verified = {**original, "max_margin_multiplier": "1", "no_shorting": True}
+        responses = []
+        # An empty PATCH body is not proof of success; the separate GET is.
+        for payload in (original, {}, verified):
+            response = requests.Response()
+            response.status_code = 200
+            response._content = json.dumps(payload).encode()
+            responses.append(response)
+        with patch.object(HTTPAdapter, "send", side_effect=responses) as send:
+            result = item.enforce_cash_only()
+        self.assertEqual(result, verified)
+        self.assertEqual([call.args[0].method for call in send.call_args_list], ["GET", "PATCH", "GET"])
+        self.assertTrue(all(call.args[0].path_url == "/v2/account/configurations"
+                            for call in send.call_args_list))
+        self.assertEqual(json.loads(send.call_args_list[1].args[0].body),
+                         {"max_margin_multiplier": "1", "no_shorting": True})
+        self.assertTrue(result["closing_transactions_only"])
+
     def test_cash_guard_is_read_only(self):
         item = broker()
-        item.trade.get_account_configurations.return_value = config()
+        item.trade.get.return_value = config()
         self.assertFalse(item.cash_settings())
+        item.trade.patch.assert_not_called()
         item.trade.set_account_configurations.assert_not_called()
-        item.trade.get_account_configurations.return_value = config(max_margin_multiplier="1", no_shorting=True)
+        item.trade.get.return_value = config(max_margin_multiplier="1", no_shorting=True)
         self.assertTrue(item.cash_settings())
 
     def test_enforcement_preserves_other_settings_and_verifies(self):
         item = broker()
-        original = config()
-        verified = original.model_copy(update={"max_margin_multiplier": "1", "no_shorting": True})
-        item.trade.get_account_configurations.side_effect = [original, verified]
+        original = config(legacy=False)
+        before = dict(original)
+        verified = {**original, "max_margin_multiplier": "1", "no_shorting": True}
+        item.trade.get.side_effect = [original, verified]
         self.assertIs(item.enforce_cash_only(), verified)
-        updated = item.trade.set_account_configurations.call_args.args[0]
-        self.assertEqual(updated.max_margin_multiplier, "1")
-        self.assertTrue(updated.no_shorting)
-        for name in type(original).model_fields:
-            if name not in {"max_margin_multiplier", "no_shorting"}:
-                self.assertEqual(getattr(updated, name), getattr(original, name))
-        self.assertEqual(original.max_margin_multiplier, "4")
+        item.trade.patch.assert_called_once_with("/account/configurations",
+            data={"max_margin_multiplier": "1", "no_shorting": True})
+        self.assertEqual(item.trade.get.call_count, 2)
+        self.assertEqual(original, before)
+        item.trade.submit_order.assert_not_called()
 
     def test_failed_enforcement_prevents_trading(self):
         item = broker()
-        item.trade.get_account_configurations.return_value = config()
+        item.trade.get.return_value = config()
         with self.assertRaisesRegex(ValueError, "not confirmed"):
             item.enforce_cash_only()
         item.trade.submit_order.assert_not_called()
+
+    def test_already_guarded_account_is_not_patched(self):
+        item = broker()
+        item.trade.get.return_value = config(legacy=False, max_margin_multiplier="1", no_shorting=True)
+        item.enforce_cash_only()
+        self.assertEqual(item.trade.get.call_count, 2)
+        item.trade.patch.assert_not_called()
+
+    def test_invalid_or_missing_guard_fields_fail_before_any_patch(self):
+        valid = config(legacy=False)
+        invalid = [None, [], "invalid", {},
+                   {key: value for key, value in valid.items() if key != "max_margin_multiplier"},
+                   {key: value for key, value in valid.items() if key != "no_shorting"}]
+        invalid += [config(max_margin_multiplier=value) for value in (None, "NaN", "Infinity", "0", "5", True)]
+        invalid += [config(no_shorting=value) for value in (None, "true", "false", 0, 1)]
+        for payload in invalid:
+            for method in ("cash_settings", "enforce_cash_only"):
+                with self.subTest(payload=payload, method=method):
+                    item = broker()
+                    item.trade.get.return_value = payload
+                    with self.assertRaisesRegex(ValueError, "configuration"):
+                        getattr(item, method)()
+                    item.trade.patch.assert_not_called()
+                    item.trade.submit_order.assert_not_called()
+
+    def test_invalid_or_incomplete_readback_does_not_confirm_guard(self):
+        for verified in ({}, config(max_margin_multiplier="1", no_shorting="true"),
+                         config(max_margin_multiplier="2", no_shorting=True),
+                         config(max_margin_multiplier="1", no_shorting=False)):
+            with self.subTest(verified=verified):
+                item = broker()
+                item.trade.get.side_effect = [config(legacy=False), verified]
+                with self.assertRaises(ValueError):
+                    item.enforce_cash_only()
+                item.trade.submit_order.assert_not_called()
+
+    def test_configuration_http_errors_are_not_treated_as_missing_optional_fields(self):
+        for status in (401, 403, 429, 500):
+            for target in ("get", "patch"):
+                with self.subTest(status=status, target=target):
+                    item = broker()
+                    item.trade.get.return_value = config(legacy=False)
+                    getattr(item.trade, target).side_effect = error(status)
+                    with self.assertRaises(APIError):
+                        item.enforce_cash_only()
+                    item.trade.submit_order.assert_not_called()
 
 
 class FillHistoryTests(unittest.TestCase):

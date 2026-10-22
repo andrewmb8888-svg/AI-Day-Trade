@@ -117,19 +117,37 @@ class Broker:
                 LOG.warning("%s disabled: instrument unavailable from broker", symbol)
         return result
 
+    def _cash_configuration(self):
+        # Some Alpaca responses omit legacy PDT fields still required by the
+        # SDK's AccountConfiguration model. Keep the authenticated SDK transport
+        # while validating the safety fields V2 actually needs, without defaults.
+        config = self.trade.get("/account/configurations")
+        if not isinstance(config, dict):
+            raise ValueError("Invalid Alpaca account configuration response; trading disabled")
+        try:
+            multiplier = money(config["max_margin_multiplier"])
+            no_shorting = config["no_shorting"]
+        except (KeyError, ValueError) as exc:
+            raise ValueError("Missing or invalid Alpaca cash-guard configuration; trading disabled") from exc
+        if not 1 <= multiplier <= 4 or type(no_shorting) is not bool:
+            raise ValueError("Invalid Alpaca cash-guard configuration; trading disabled")
+        return config
+
     def cash_settings(self):
-        config = self.trade.get_account_configurations()
-        return money(config.max_margin_multiplier) == 1 and config.no_shorting is True
+        config = self._cash_configuration()
+        return money(config["max_margin_multiplier"]) == 1 and config["no_shorting"] is True
 
     def enforce_cash_only(self):
         """Explicit trading startup policy; never used by the read-only check."""
-        config = self.trade.get_account_configurations()
-        if money(config.max_margin_multiplier) != 1 or config.no_shorting is not True:
+        config = self._cash_configuration()
+        if money(config["max_margin_multiplier"]) != 1 or config["no_shorting"] is not True:
             LOG.warning("Applying account-wide policy: max margin multiplier=1; no shorting")
-            updated = config.model_copy(update={"max_margin_multiplier": "1", "no_shorting": True})
-            self.trade.set_account_configurations(updated)
-        verified = self.trade.get_account_configurations()
-        if money(verified.max_margin_multiplier) != 1 or verified.no_shorting is not True:
+            # PATCH only these two controls, preserving every unrelated broker
+            # setting, including fields not known by the installed SDK model.
+            self.trade.patch("/account/configurations",
+                             data={"max_margin_multiplier": "1", "no_shorting": True})
+        verified = self._cash_configuration()
+        if money(verified["max_margin_multiplier"]) != 1 or verified["no_shorting"] is not True:
             raise ValueError("Broker cash-only/long-only restrictions were not confirmed; trading disabled")
         return verified
 

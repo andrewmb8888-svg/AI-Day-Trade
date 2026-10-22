@@ -72,7 +72,8 @@ For a fresh Windows installation, use `python -m venv .venv` and replace
 
 **At trading startup, V2 sets Alpaca's account-wide `max_margin_multiplier` to
 `1` and `no_shorting` to `True`, preserving other account configuration fields.
-It verifies the settings before entering the trading loop.** This is an
+Only these two fields are sent, and a fresh read verifies the settings before
+entering the trading loop.** This is an
 account-wide change, not a separate subaccount or a conversion to a formal cash
 account. If the broker does not confirm it, V2 refuses to trade. `--check` and
 `--status` never make this change.
