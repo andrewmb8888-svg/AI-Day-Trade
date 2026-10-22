@@ -1,0 +1,8 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+.v2-state-*.json
+..v2-state-*.tmp
+.bot-*.lock
+trade_v2_log.txt*
