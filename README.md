@@ -1,6 +1,7 @@
 # RSI/MACD Alpaca paper-trading bot
 
 **AI Day Trade V2** is available separately in [AI-Day-Trade-V2](AI-Day-Trade-V2/README.md).
+[Download the V2 ZIP](https://github.com/andrewmb8888-svg/AI-Day-Trade/raw/refs/heads/main/AI-Day-Trade-V2.zip).
 It uses a 20-symbol watchlist, completed 30-minute bars, 10-second checks, and a
 shared cash-backed budget. Stop V1 before starting V2 on the same account.
 The original `trading_bot.py` and its strategy are preserved below.
